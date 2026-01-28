@@ -1433,6 +1433,18 @@ private struct OpenAIChatCompletionsChunk: Decodable, Sendable {
         struct Delta: Decodable, Sendable {
             let role: String?
             let content: String?
+            let tool_calls: [ToolCallDelta]?
+
+            struct ToolCallDelta: Decodable, Sendable {
+                let index: Int
+                let id: String?
+                let function: FunctionDelta?
+
+                struct FunctionDelta: Decodable, Sendable {
+                    let name: String?
+                    let arguments: String?
+                }
+            }
         }
         let delta: Delta
         let finishReason: String?

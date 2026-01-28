@@ -46,6 +46,7 @@ print(response.content)
 - [x] Ollama [HTTP API](https://github.com/ollama/ollama/blob/main/docs/api.md)
 - [x] Anthropic [Messages API](https://docs.claude.com/en/api/messages)
 - [x] Google [Gemini API](https://ai.google.dev/api/generate-content)
+- [x] Alibaba Cloud [Qwen (DashScope) API](https://help.aliyun.com/zh/dashscope/developer-reference/api-details-openai)
 - [x] OpenAI [Chat Completions API](https://platform.openai.com/docs/api-reference/chat)
 - [x] OpenAI [Responses API](https://platform.openai.com/docs/api-reference/responses)
 
