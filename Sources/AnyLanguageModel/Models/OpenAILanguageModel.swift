@@ -1673,6 +1673,8 @@ private func resolveToolCalls(
             continue
         }
 
+        print("[OpenAI-Debug] Tool '\(tool.name)' call arguments: \(function.arguments ?? "nil")")
+
         do {
             let segments = try await tool.makeOutputSegments(from: args)
             let output = Transcript.ToolOutput(
