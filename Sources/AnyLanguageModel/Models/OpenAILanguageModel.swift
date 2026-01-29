@@ -686,23 +686,50 @@ public struct OpenAILanguageModel: LanguageModel {
             return LanguageModelSession.ResponseStream(stream: stream)
 
         case .chatCompletions:
-            let params = ChatCompletions.createRequestBody(
-                model: model,
-                messages: session.transcript.toOpenAIMessages(),
-                tools: openAITools,
-                options: options,
-                stream: true
-            )
-
             let url = baseURL.appendingPathComponent("chat/completions")
-
+            
             let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init {
                 continuation in
                 let task = Task { @Sendable in
                     do {
-                        let body = try JSONEncoder().encode(params)
+                        // Create a local copy of messages that we can append to during tool loops
+                        var currentMessages = session.transcript.toOpenAIMessages()
+                        
+                        // Debug: Print Initial Tool Configuration
+                        if let tools = openAITools {
+                             print("[OpenAI-Debug] Tools count: \(tools.count)")
+                             // print("[OpenAI-Debug] Tool Definitions: \(tools.map { $0.jsonValue(for: .chatCompletions) })")
+                        } else {
+                             print("[OpenAI-Debug] No tools provided.")
+                        }
 
-                        let events: AsyncThrowingStream<OpenAIChatCompletionsChunk, any Error> =
+                        // We loop to handle sequential tool calls (ReAct loop)
+                        loop: while true {
+                            print("[OpenAI-Debug] Requesting Chat Completion. Messages in history: \(currentMessages.count)")
+                            if let last = currentMessages.last {
+                                print("[OpenAI-Debug] Last Message Role: \(last.role)")
+                                if case .tool(let id) = last.role {
+                                     print("[OpenAI-Debug] Tool Response ID: \(id)")
+                                }
+                            }
+                            
+                            // Debug: Dump full messages structure for inspection
+                            if let debugData = try? JSONEncoder().encode(currentMessages.map { $0.jsonValue(for: .chatCompletions) }),
+                               let debugStr = String(data: debugData, encoding: .utf8) {
+                                print("[OpenAI-Debug] Payload Messages Summary: \(debugStr.suffix(500))") // Last 500 chars to check tail
+                            }
+
+                            let params = ChatCompletions.createRequestBody(
+                                model: model,
+                                messages: currentMessages,
+                                tools: openAITools,
+                                options: options,
+                                stream: true
+                            )
+                            
+                            let body = try JSONEncoder().encode(params)
+                            
+                            let events: AsyncThrowingStream<OpenAIChatCompletionsChunk, any Error> =
                             urlSession.fetchEventStream(
                                 .post,
                                 url: url,
@@ -711,26 +738,138 @@ public struct OpenAILanguageModel: LanguageModel {
                                 ],
                                 body: body
                             )
-
-                        var accumulatedText = ""
-
-                        for try await chunk in events {
-                            if let choice = chunk.choices.first {
-                                if let piece = choice.delta.content, !piece.isEmpty {
-                                    accumulatedText += piece
-
-                                    let raw = GeneratedContent(accumulatedText)
-                                    let content: Content.PartiallyGenerated = (accumulatedText as! Content)
-                                        .asPartiallyGenerated()
-                                    continuation.yield(.init(content: content, rawContent: raw))
-                                }
-
-                                if choice.finishReason != nil {
-                                    continuation.finish()
+                            
+                            var accumulatedText = ""
+                            var toolCallBuilders: [Int: ToolCallBuilder] = [:]
+                            var finishReason: String? = nil
+                            
+                            for try await chunk in events {
+                                if let choice = chunk.choices.first {
+                                    if let piece = choice.delta.content, !piece.isEmpty {
+                                        accumulatedText += piece
+                                        
+                                        let raw = GeneratedContent(accumulatedText)
+                                        let content: Content.PartiallyGenerated = (accumulatedText as! Content)
+                                            .asPartiallyGenerated()
+                                        continuation.yield(.init(content: content, rawContent: raw))
+                                    }
+                                    
+                                    if let toolDeltas = choice.delta.tool_calls {
+                                        for delta in toolDeltas {
+                                            var builder = toolCallBuilders[delta.index] ?? ToolCallBuilder(index: delta.index, id: delta.id, name: delta.function?.name, arguments: "")
+                                            if let args = delta.function?.arguments {
+                                                builder.arguments += args
+                                            }
+                                            // Ensure ID and Name are captured (usually in first chunk)
+                                            if let id = delta.id { builder.id = id }
+                                            if let name = delta.function?.name { builder.name = name }
+                                            
+                                            toolCallBuilders[delta.index] = builder
+                                        }
+                                    }
+                                    
+                                    if let reason = choice.finishReason {
+                                        finishReason = reason
+                                    }
                                 }
                             }
+                            
+                            // Check if verify have tool calls to execute
+                            // Note: Some compatible models might return "stop" instead of "tool_calls"
+                            if !toolCallBuilders.isEmpty {
+                                // Convert builders to OpenAIToolCall
+                                let toolCalls = toolCallBuilders.values.sorted(by: { $0.index < $1.index }).compactMap { builder -> OpenAIToolCall? in
+                                    
+                                    // RECOVERY STRATEGY:
+                                    // If name is missing/empty, but we only have one tool, assume it's that one.
+                                    var finalName = builder.name
+                                    if (finalName == nil || finalName?.isEmpty == true),
+                                       session.tools.count == 1,
+                                       let singleTool = session.tools.first {
+                                        finalName = singleTool.name
+                                        print("[OpenAI-Debug] Recovered empty tool name using single available tool: \(singleTool.name)")
+                                    }
+                                    
+                                    // Make sure we have a valid name. ID can be patched if missing.
+                                    guard let name = finalName, !name.isEmpty else { return nil }
+                                    
+                                    // Qwen/Compatible API Fix: Ensure ID is present and non-empty. 
+                                    // If missing, generate one to maintain conversation consistency.
+                                    var id = builder.id ?? ""
+                                    if id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        id = "call_\(UUID().uuidString.prefix(8))"
+                                    }
+                                    
+                                    return OpenAIToolCall(id: id, type: "function", function: .init(name: name, arguments: builder.arguments))
+                                }
+                                
+                                if !toolCalls.isEmpty {
+                                    print("[OpenAI-Debug] Executing \(toolCalls.count) tool calls. IDs: \(toolCalls.map { $0.id })")
+                                    // 1. Add tool calls to transcript
+                                    let invocations = try await resolveToolCalls(toolCalls, session: session)
+                                    
+                                    if !invocations.isEmpty {
+                                        // Update session transcript
+                                        let toolCallsEntry = Transcript.Entry.toolCalls(Transcript.ToolCalls(invocations.map { $0.call }))
+                                        var newEntries: [Transcript.Entry] = [toolCallsEntry]
+                                        
+                                        // 2. Add raw messages for OpenAI context
+                                        // Construct JSON for assistant message with tool_calls
+                                        var assistantMsgDict: [String: JSONValue] = [
+                                            "role": .string("assistant")
+                                        ]
+                                        
+                                        if !accumulatedText.isEmpty {
+                                             assistantMsgDict["content"] = .string(accumulatedText)
+                                        } else {
+                                             assistantMsgDict["content"] = .null
+                                        }
+                                        
+                                        if !toolCalls.isEmpty {
+                                            // Encode tool calls to JSONValue
+                                            if let toolCallsData = try? JSONEncoder().encode(toolCalls),
+                                               let toolCallsJSON = try? JSONDecoder().decode(JSONValue.self, from: toolCallsData) {
+                                                  // OpenAIToolCall encodes to matches API structure? 
+                                                  // OpenAIToolCall struct has private visibility, let's check its Codable implementation or structure
+                                                  // It seems standard.
+                                                  assistantMsgDict["tool_calls"] = toolCallsJSON
+                                            }
+                                        }
+                                        
+                                        currentMessages.append(OpenAIMessage(role: .raw(rawContent: .object(assistantMsgDict)), content: .text(accumulatedText)))
+                                        
+                                        // 3. Process Tool Outputs
+                                        for invocation in invocations {
+                                            let output = invocation.output
+                                            newEntries.append(.toolOutput(output))
+                                            
+                                            // Convert to OpenAI Message
+                                            let toolSegments = output.segments
+                                            
+                                            // Optimization: Use simple string content if possible (better compatibility)
+                                            let toolMsg: OpenAIMessage
+                                            if toolSegments.count == 1, case .text(let textSeg) = toolSegments[0] {
+                                                toolMsg = OpenAIMessage(role: .tool(id: invocation.call.id), content: .text(textSeg.content))
+                                            } else {
+                                                let blocks = convertSegmentsToOpenAIBlocks(toolSegments)
+                                                toolMsg = OpenAIMessage(role: .tool(id: invocation.call.id), content: .blocks(blocks))
+                                            }
+                                            currentMessages.append(toolMsg)
+                                        }
+                                        
+                                        // Update Transcript
+                                        await session.append(contentsOf: newEntries)
+                                        
+                                        // Continue loop to fetch next response
+                                        continue loop
+                                    }
+                                }
+                            }
+                            
+                            // If we get here, it's a normal finish or error or no tools
+                            break loop
                         }
-
+                        
                         continuation.finish()
                     } catch {
                         continuation.finish(throwing: error)
@@ -743,6 +882,16 @@ public struct OpenAILanguageModel: LanguageModel {
         }
     }
 }
+
+// MARK: - Helpers
+
+private struct ToolCallBuilder {
+    var index: Int
+    var id: String?
+    var name: String?
+    var arguments: String
+}
+
 
 // MARK: - API Variants
 
@@ -762,6 +911,7 @@ private enum ChatCompletions {
 
         if let tools {
             body["tools"] = .array(tools.map { $0.jsonValue(for: .chatCompletions) })
+            body["tool_choice"] = .string("auto")
         }
 
         if let temperature = options.temperature {
@@ -1317,7 +1467,7 @@ private struct OpenAITool: Hashable, Codable, Sendable {
         case .chatCompletions:
             return .object([
                 "type": .string(type),
-                "function": function.jsonValue,
+                "function": function.jsonValue(for: apiVariant),
             ])
         case .responses:
             // Responses API expects name, description, and parameters at the top level
@@ -1326,11 +1476,21 @@ private struct OpenAITool: Hashable, Codable, Sendable {
                 "name": .string(function.name),
                 "description": .string(function.description),
             ]
-            if let rawParameters = function.rawParameters {
-                obj["parameters"] = rawParameters
-            } else if let parameters = function.parameters {
-                obj["parameters"] = parameters.jsonValue
+            
+            // Re-use safe parameter extraction
+            var paramDict: JSONValue? = nil
+             if let raw = function.rawParameters {
+                paramDict = raw
+            } else if let p = function.parameters {
+                paramDict = p.jsonValue
             }
+            
+            if let paramDict = paramDict {
+                 obj["parameters"] = paramDict
+            } else {
+                 obj["parameters"] = .object(["type": .string("object"), "properties": .object([:])])
+            }
+            
             return .object(obj)
         }
     }
@@ -1344,16 +1504,28 @@ private struct OpenAIFunction: Hashable, Codable, Sendable {
     // to preserve nested object structures.
     let rawParameters: JSONValue?
 
-    var jsonValue: JSONValue {
+    func jsonValue(for apiVariant: OpenAILanguageModel.APIVariant) -> JSONValue {
         var obj: [String: JSONValue] = [
             "name": .string(name),
             "description": .string(description),
         ]
-        if let rawParameters {
-            obj["parameters"] = rawParameters
-        } else if let parameters {
-            obj["parameters"] = parameters.jsonValue
+        
+        // Always extract parameters, preferably from rawParameters
+        var paramDict: JSONValue? = nil
+        
+        if let raw = rawParameters {
+            paramDict = raw
+        } else if let p = parameters {
+            paramDict = p.jsonValue
         }
+        
+        if let paramDict = paramDict {
+             obj["parameters"] = paramDict
+        } else {
+             // OpenAI requires parameters to be present, even if empty
+             obj["parameters"] = .object(["type": .string("object"), "properties": .object([:])])
+        }
+
         return .object(obj)
     }
 }

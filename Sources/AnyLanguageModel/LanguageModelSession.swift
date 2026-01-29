@@ -81,6 +81,22 @@ public final class LanguageModelSession: @unchecked Sendable {
         model.prewarm(for: self, promptPrefix: promptPrefix)
     }
 
+    /// Appends an entry to the transcript.
+    ///
+    /// This method is primarily used by language models to update the transcript
+    /// during streaming operations, such as when tool calls occur.
+    public func append(entry: Transcript.Entry) async {
+        await MainActor.run {
+            self.transcript.append(entry)
+        }
+    }
+    
+    public func append(contentsOf entries: [Transcript.Entry]) async {
+        await MainActor.run {
+            self.transcript.append(contentsOf: entries)
+        }
+    }
+
     nonisolated private func beginResponding() async {
         let count = await respondingState.increment()
         let active = count > 0
